@@ -4,8 +4,8 @@ open Hardcaml.Signal
 
 let ceil_div a b = 1 + (a - 1) / b 
 
-let word_width = 4
-let line_width = 15
+let word_width = 2
+let line_width = 3
 
 let acc_width = 8
 
@@ -51,7 +51,8 @@ let propagate_beams ~last ~beams:(beams1, beams0) ~splitters:(splitters1, splitt
   let split_left = (sll hits 1) |: carry_in_left in
   let beams_next = linenosplit |: split_left |: split_right in
   beams_next, bit hits 0, popcount hits
-  
+
+(** Will store the ram and *)
 let dual_port_ram ~clock ~write_address ~write_enable ~write_data ~read_address =
   let spec = Reg_spec.create ~clock () in
   (multiport_memory
@@ -106,10 +107,11 @@ let create scope ({ clock; clear; valid; data } : _ I.t) =
     ~splitters:(splitters.(1).value, splitters.(0).value) ~prev_bit:prev_bit.value in
 
   let%hw write_enable = ~:(sm.is Wait) in
-  let%hw write_address = counter_sr.(1).value in
+  let%hw write_address = concat_lsb [buf_sel.value; mux2 (sm.is Set) counter.value counter_sr.(1).value] in
+  let%hw write_data = mux2 (sm.is Set) data beams_next in
   let%hw read_address = concat_lsb [buf_sel.value; counter.value] in
 
-  beams0 <== dual_port_ram ~clock ~write_address ~write_enable ~write_data:beams_next ~read_address;
+  beams0 <== dual_port_ram ~clock ~write_address ~write_enable ~write_data ~read_address;
 
   (* Advance the pipeline *)
   let advance () =
@@ -120,9 +122,9 @@ let create scope ({ clock; clear; valid; data } : _ I.t) =
 
   [ sm.switch
     [ (Set,
-      [ when_ valid
-        [ counter <-- counter.value +:. 1
-        ]])
+      [ when_ valid [counter <-- counter.value +:. 1]
+      ; when_ last [sm.set_next Wait]
+      ])
     ; (Wait,
       [ when_ valid
         [ advance ()
@@ -133,7 +135,7 @@ let create scope ({ clock; clear; valid; data } : _ I.t) =
       [ when_ valid
         [ counter <-- counter.value +:. 1
         ; prev_bit <-- prev_bit_next
-        ; acc <-- acc.value +: count
+        ; acc <-- acc.value +: uresize count acc_width
         ; advance ()
         ; when_ last
           [ counter <--. 0
@@ -145,7 +147,7 @@ let create scope ({ clock; clear; valid; data } : _ I.t) =
     ; (Flush,
       [ flush_cnt <-- flush_cnt.value -:. 1
       ; advance ()
-      ; acc <-- acc.value +: count
+      ; acc <-- acc.value +: uresize count acc_width
       ; prev_bit <-- prev_bit_next
       ; when_ valid [ counter <-- counter.value +:. 1 ]
       ; when_ (flush_cnt.value ==:. 0)
