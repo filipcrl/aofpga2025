@@ -31,20 +31,21 @@ end
 
 module State = struct
   type t =
-    | Start
-    | Process
-    | Last
+    | Two_left
+    | One_left
+    | Run
+    | Flush
     [@@deriving sexp_of, compare ~localize, enumerate]
 end
 
-let line_next_ set is_last line line_next cur next prev_bit =
+let line_next_ ~set ~last ~line ~line_next ~cur ~next ~prev_bit =
   let w = width line in
   let hits = line &: cur in
   let hits_next = line_next &: next in
   let linenosplit = line &: (~: cur) in
   let carry_in_right = sll (uresize prev_bit w) (w - 1) in
   let split_right = (srl hits 1) |: carry_in_right in
-  let next_msb = mux2 is_last gnd (bit hits_next (w - 1)) in
+  let next_msb = mux2 last gnd (bit hits_next (w - 1)) in
   let carry_in_left = uresize next_msb w in
   let split_left = (sll hits 1) |: carry_in_left in
   let computed_next = linenosplit |: split_left |: split_right in
@@ -64,45 +65,79 @@ let dual_port_ram ~clock ~write_address ~write_enable ~write_data ~read_address 
      ~read_addresses:[| read_address |]).(0)
   |> reg spec
 
-let create _scope ({ clock; clear; data; enable; set } : _ I.t) =
+let create scope ({ clock; clear; valid; data; set } : _ I.t) =
   let open Always in
   let spec = Reg_spec.create ~clock ~clear () in
 
-  let acc = Variable.reg ~width:acc_width spec in
-  let buf = Variable.reg ~width:word_width spec in
-  let counter = Variable.reg ~width:counter_w spec in
-  let prev_bit = Variable.reg ~width:counter_w spec in
+  let%hw_var acc = Variable.reg ~width:acc_width spec in
+  let%hw_var counter = Variable.reg ~width:counter_w spec in
+
+  let%hw_var flush_cnt = Variable.reg ~width:2 spec in
+
+  let input_bufs = Array.init 2 ~f:(fun _ -> Variable.reg ~width:word_width spec) in
+  let beams_buf = Variable.reg ~width:word_width spec in
+
+  let prev_bit = Variable.reg ~width:1 spec in
   let buf_sel = Variable.reg ~width:1 spec in 
 
-  let a = wire 1 in
-
+  let beams = wire word_width in
   let last = counter.value ==:. counter_max - 1 in
-  let line_next, prev_bit_next, count =
-    line_next_ set last line line_next
-      buf.value data prev_bit.value in
+  let line_next, prev_bit_next, count = line_next_
+    ~set ~last ~line:buf_line.value ~line_next:line_nxt
+    ~cur:buf.value ~next:data ~prev_bit:prev_bit.value in
 
   let sm = State_machine.create (module State) spec in
 
   let write_enable = sm.is Process in
-  let write_address = concat_lsb [~: (buf_sel.value); counter.value] in
+  let write_address = mux2 (sm.is Start)
+    (of_int ~width:(counter_w + 1) 0)
+    (concat_lsb [~: (buf_sel.value); counter.value +:. 1]) in
   let read_address = concat_lsb [buf_sel.value; counter.value] in
 
-  let line = dual_port_ram ~clock ~write_address ~write_enable ~write_data:line_next ~read_address in
+  beams <== dual_port_ram ~clock ~write_address ~write_enable ~write_data:line_next ~read_address;
+
+  (* Advance the pipeline *)
+  let advance () =
+    [ input_bufs.(1) <-- input_bufs.(0).value
+    ; input_bufs.(0) <-- data
+    ; beams_buf <-- beams
+    ] in
 
   [ sm.switch
-    [ (Start,
-      [ counter <--. 0
-      ; prev_bit <--. 0
-      ; buf_sel <--. 0
-      ; sm.set_next Process
+    [ (Two_left,
+      [ when_ valid
+        [ proc (advance ())
+        ; sm.set_next One_left
+        ]
       ])
-    ; (Process,
-      [ counter <-- counter.value +:. 1
-      ; prev_bit <-- prev_bit_next
-      ; acc <-- acc.value +: count
-      ; when_ (last) [sm.set_next Start]
+    ; (One_left,
+      [ when_ valid
+        [ counter <-- counter.value +:. 1
+        ; proc (advance ())
+        ; sm.set_next Run
+        ]
+      ])
+    ; (Run,
+      [ when_ valid
+        [ counter <-- counter.value +:. 1
+        ; prev_bit <-- prev_bit_next
+        ; acc <-- acc.value +: count
+        ; when_ last
+          [ counter <--. 0
+          ; flush_cnt <--. 2
+          ; sm.set_next Flush
+          ]
+        ]])
+    ; (Flush,
+      [ flush_cnt <-- flush_cnt.value -:. 1
+      ; proc (advance ())
+      ; when_ (valid &&: (flush_cnt.value <>:. 0))
+        [ counter <-- counter.value +:. 1
+        ]
+      ; when_ (flush_cnt.value ==:. 0)
+        [ 
+        ]
       ])
     ]
-  ; buf <-- data
   ] |> compile;
   { O.out=acc.value; line_next }
