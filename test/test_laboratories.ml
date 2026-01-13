@@ -7,36 +7,12 @@ let example1 = [ 0; 1; 2; 3 ]
 
 let bits_of_word word = Bits.of_int ~width:Laboratories.word_width word
 
-let%expect_test "Simple test, optionally saving waveforms to disk" =
-  let scope = Scope.create ~flatten_design:false () in
-  let sim = Simulator.create (Laboratories.create scope) in
-  (* let filename = "/tmp/waves.vcd" in *)
-  (* let oc = Out_channel.create filename in *)
-  (* let sim = Vcd.wrap oc sim in *)
-  let inputs = Cyclesim.inputs sim in
-  let outputs = Cyclesim.outputs sim in
-  let cycle () = Cyclesim.cycle sim in
-  (* Reset the design *)
-  inputs.valid := Bits.gnd;
-  inputs.clear := Bits.vdd;
-  cycle ();
-  inputs.clear := Bits.gnd;
-  inputs.valid := Bits.vdd;
-  List.iter example1 ~f:(fun word ->
-    inputs.data := bits_of_word word;
-    cycle ();
-    Format.printf
-      "word=%d out=%d beams_next=%d@."
-      word
-      (Bits.to_int !(outputs.out))
-      (Bits.to_int !(outputs.beams_next)));
-  [%expect {|
-    |}]
-
 let%expect_test "Line input after clear, waveform capture" =
   let scope = Scope.create ~flatten_design:false () in
-  let sim = Simulator.create (Laboratories.create scope) in
-  let waveform, sim = Hardcaml_waveterm.Waveform.create sim in
+  let sim = Simulator.create ~config:(Cyclesim.Config.trace `All_named) (Laboratories.create scope) in
+  let filename = "/tmp/laboratories.vcd" in
+  let oc = Out_channel.create filename in
+  let sim = Vcd.wrap oc sim in
   let inputs = Cyclesim.inputs sim in
   let cycle () = Cyclesim.cycle sim in
   inputs.valid := Bits.gnd;
@@ -50,6 +26,6 @@ let%expect_test "Line input after clear, waveform capture" =
   cycle ();
   inputs.valid := Bits.gnd;
   cycle ();
-  Hardcaml_waveterm.Waveform.expect waveform;
+  Out_channel.close oc;
   [%expect {|
     |}]

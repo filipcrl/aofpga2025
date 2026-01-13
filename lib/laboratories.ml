@@ -107,9 +107,9 @@ let create scope ({ clock; clear; valid; data } : _ I.t) =
     ~splitters:(splitters.(1).value, splitters.(0).value) ~prev_bit:prev_bit.value in
 
   let%hw write_enable = ~:(sm.is Wait) in
-  let%hw write_address = concat_lsb [buf_sel.value; mux2 (sm.is Set) counter.value counter_sr.(1).value] in
+  let%hw write_address = concat_msb [buf_sel.value; mux2 (sm.is Set) counter.value counter_sr.(1).value] in
   let%hw write_data = mux2 (sm.is Set) data beams_next in
-  let%hw read_address = concat_lsb [buf_sel.value; counter.value] in
+  let%hw read_address = concat_msb [buf_sel.value; counter.value] in
 
   beams0 <== dual_port_ram ~clock ~write_address ~write_enable ~write_data ~read_address;
 
@@ -128,6 +128,7 @@ let create scope ({ clock; clear; valid; data } : _ I.t) =
     ; (Wait,
       [ when_ valid
         [ advance ()
+        ; Shift_register.shift counter_sr counter.value
         ; counter <-- counter.value +:. 1
         ; when_ (counter.value ==:. 1) [sm.set_next Run]
         ]])
