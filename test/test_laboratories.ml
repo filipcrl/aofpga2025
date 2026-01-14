@@ -94,6 +94,11 @@ type gap =
       { seed : int
       ; max_gap : int
       }
+  | Random_range of
+      { seed : int
+      ; min_gap : int
+      ; max_gap : int
+      }
 
 let next_gap_fn = function
   | Fixed n ->
@@ -103,9 +108,15 @@ let next_gap_fn = function
     if max_gap < 0 then invalid_arg "max_gap must be >= 0";
     let rng = Random.State.make [| seed |] in
     fun () -> Random.State.int rng (max_gap + 1)
+  | Random_range { seed; min_gap; max_gap } ->
+    if min_gap < 0 then invalid_arg "min_gap must be >= 0";
+    if max_gap < min_gap then invalid_arg "max_gap must be >= min_gap";
+    let rng = Random.State.make [| seed |] in
+    fun () -> min_gap + Random.State.int rng (max_gap - min_gap + 1)
 
 let simulate_and_capture
   ?save_path
+  ?(config = Cyclesim.Config.trace_all)
   (module Dut : Laboratories_intf.S)
   ~word_w
   ~lines
@@ -118,7 +129,7 @@ let simulate_and_capture
 
   let scope = Scope.create ~flatten_design:false () in
   let module Simulator = Cyclesim.With_interface (Dut.I) (Dut.O) in
-  let sim = Simulator.create ~config:Cyclesim.Config.trace_all (Dut.create scope) in
+  let sim = Simulator.create ~config (Dut.create scope) in
   let run (sim : Simulator.t) =
     let inputs = Cyclesim.inputs sim in
     let outputs_before = Cyclesim.outputs ~clock_edge:Before sim in
@@ -363,7 +374,7 @@ let%expect_test "short input, 3b word, seeded random gap" =
     |}]
 
 let%expect_test "example, 4b word, multiple random tests" =
-  run_input (module Dut_4b) ~save_path:"/tmp/4bword.vcd" ~input:example_input ~word_w:4 ~gap:(Random { seed=123; max_gap=5 });
+  run_input (module Dut_4b) ~input:example_input ~word_w:4 ~gap:(Random { seed=123; max_gap=5 });
   [%expect {|
     .......S.......
     .......|.......
@@ -388,10 +399,112 @@ let%expect_test "bigtest, 64b word" =
   run_bigtest (module Big_dut_64b) ~word_w:64 ~gap:(Fixed 0);
   run_bigtest (module Big_dut_64b) ~word_w:64 ~gap:(Fixed 1);
   run_bigtest (module Big_dut_64b) ~word_w:64 ~gap:(Fixed 2);
-  run_bigtest (module Big_dut_64b) ~word_w:64 ~gap:(Random { seed = 123; max_gap = 3 });
+  run_bigtest (module Big_dut_64b) ~word_w:64 ~gap:(Random { seed = 113; max_gap = 5 });
   [%expect {|
     result=1587
     result=1587
     result=1587
     result=1587
     |}]
+
+let%expect_test "bigtest, random gaps 1..10, stable result" =
+  let sourceroot = Sys.getenv_exn "DUNE_SOURCEROOT" in
+  let bigtest_path = Filename.concat sourceroot "test/bigtest.txt" in
+  let lines = In_channel.read_all bigtest_path |> strip_and_filter_lines in
+  let word_w = 64 in
+  let words = List.concat_map lines ~f:(fun line -> words_of_line ~word_w line) in
+  let expected_words = List.length words in
+
+  let scope = Scope.create ~flatten_design:false () in
+  let module Simulator = Cyclesim.With_interface (Big_dut_64b.I) (Big_dut_64b.O) in
+  let sim = Simulator.create ~config:Cyclesim.Config.default (Big_dut_64b.create scope) in
+  let inputs = Cyclesim.inputs sim in
+  let outputs_before = Cyclesim.outputs ~clock_edge:Before sim in
+  let outputs_after = Cyclesim.outputs sim in
+
+  let run_once ~gap =
+    Cyclesim.reset sim;
+    let captured_word_count = ref 0 in
+    let capture_if_ready () =
+      if !captured_word_count < expected_words
+         && Bits.is_vdd !(outputs_before.beams_valid)
+      then incr captured_word_count
+    in
+    let cycle () =
+      Cyclesim.cycle sim;
+      capture_if_ready ()
+    in
+
+    let next_gap = next_gap_fn gap in
+
+    inputs.valid := Bits.gnd;
+    inputs.clear := Bits.vdd;
+    inputs.data := Bits.zero word_w;
+    cycle ();
+    inputs.clear := Bits.gnd;
+
+    List.iter words ~f:(fun word ->
+      inputs.valid := Bits.vdd;
+      inputs.data := word;
+      cycle ();
+      inputs.valid := Bits.gnd;
+      inputs.data := Bits.(ones (width word));
+      for _ = 1 to next_gap () do
+        cycle ()
+      done);
+
+    inputs.valid := Bits.gnd;
+
+    let quiet_cycles_required = 10 in
+    let quiet_cycles = ref 0 in
+    let max_cycles_after_input = expected_words * 100 + 1_000 in
+    let cycles_after_input = ref 0 in
+    while
+      !cycles_after_input < max_cycles_after_input
+      && (!captured_word_count < expected_words || !quiet_cycles < quiet_cycles_required)
+    do
+      incr cycles_after_input;
+      cycle ();
+      if Bits.is_vdd !(outputs_before.beams_valid)
+      then quiet_cycles := 0
+      else incr quiet_cycles
+    done;
+
+    if !captured_word_count <> expected_words
+    then
+      raise_s
+        [%message
+          "Timed out waiting for expected output words"
+            (expected_words : int)
+            (!captured_word_count : int)
+            (max_cycles_after_input : int)];
+
+    if !quiet_cycles < quiet_cycles_required
+    then
+      raise_s
+        [%message
+          "Timed out waiting for the design to go quiet"
+            (quiet_cycles_required : int)
+            (!quiet_cycles : int)
+            (max_cycles_after_input : int)];
+
+    Bits.to_int !(outputs_after.out)
+  in
+
+  let expected = run_once ~gap:(Fixed 0) in
+  let rng = Random.State.make [| 0x5EED |] in
+  for trial = 1 to 200 do
+    let seed = Random.State.int rng Int.max_value in
+    let result = run_once ~gap:(Random_range { seed; min_gap = 1; max_gap = 10 }) in
+    if result <> expected
+    then
+      raise_s
+        [%message
+          "Result mismatch under random gaps"
+            (trial : int)
+            (seed : int)
+            (expected : int)
+            (result : int)]
+  done;
+  printf "result=%d\n" expected;
+  [%expect {| result=1587 |}]
