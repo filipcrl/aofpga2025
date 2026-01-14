@@ -2,10 +2,10 @@ open Core
 open Hardcaml
 open Hardcaml.Signal
 
-let ceil_div a b = 1 + (a - 1) / b 
+let ceil_div a b = 1 + ((a - 1) / b) 
 
-let word_width = 2
-let line_width = 3
+let word_width = 1
+let line_width = 5
 
 let acc_width = 8
 
@@ -23,8 +23,9 @@ end
 
 module O = struct
   type 'a t = 
-    { out        : 'a[@bits acc_width]
-    ; beams_next : 'a[@bits word_width]
+    { out         : 'a[@bits acc_width]
+    ; beams_next  : 'a[@bits word_width]
+    ; beams_valid : 'a
     } [@@deriving hardcaml]
 end
 
@@ -70,8 +71,13 @@ let dual_port_ram ~clock ~write_address ~write_enable ~write_data ~read_address 
 module Shift_register = struct
   type t = Always.Variable.t array
 
-  let create ~width ~n spec =
-    Array.init n ~f:(fun _ -> Always.Variable.reg ~width spec)
+  let create ?name ~width ~n spec =
+    Array.init n ~f:(fun i ->
+      let reg = Always.Variable.reg ~width spec in
+      (match name with
+      | Some name -> reg.value -- (Printf.sprintf "%s-%d" name i) |> ignore;
+      | None -> ());
+      reg)
 
   let shift t data =
     let open Always in
@@ -87,31 +93,40 @@ let create scope ({ clock; clear; valid; data } : _ I.t) =
   let spec = Reg_spec.create ~clock ~clear () in
 
   let%hw_var acc = Variable.reg ~width:acc_width spec in
-  let counter = Variable.reg ~width:counter_w spec in
-  let counter_sr = Shift_register.create ~width:counter_w ~n:2 spec in
+  let%hw_var counter = Variable.reg ~width:counter_w spec in
 
   let%hw_var flush_cnt = Variable.reg ~width:2 spec in
 
-  let splitters = Shift_register.create ~width:word_width ~n:2 spec in
-  let beams1 = Variable.reg ~width:word_width spec in
+  let splitters = Shift_register.create ~name:"splitters" ~width:word_width ~n:2 spec in
+  let%hw_var beams1 = Variable.reg ~width:word_width spec in
+
+  let write_address_sr = Shift_register.create ~width:(counter_w+1) ~n:2 spec in
 
   let prev_bit = Variable.reg ~width:1 spec in
   let buf_sel = Variable.reg ~width:1 spec in 
 
-  let sm = State_machine.create (module State) spec in
+  let sm = State_machine.create ~auto_wave_format:true (module State) spec in
+  let _debug = sm.current -- "state" in
 
-  let beams0 = wire word_width in
-  let last = counter.value ==:. counter_max - 1 in
+  let beams0 = wire word_width -- "beams0" in
+  let%hw last = counter.value ==:. counter_max - 1 in
+  let last_sr = Shift_register.create ~name:"last" ~width:1 ~n:2 spec in
   let beams_next, prev_bit_next, count = propagate_beams
-    ~last ~beams:(beams1.value, beams0)
+    ~last:last_sr.(1).value ~beams:(beams1.value, beams0)
     ~splitters:(splitters.(1).value, splitters.(0).value) ~prev_bit:prev_bit.value in
 
   let%hw write_enable = ~:(sm.is Wait) in
-  let%hw write_address = concat_msb [buf_sel.value; mux2 (sm.is Set) counter.value counter_sr.(1).value] in
+  let beams_write_addr = concat_msb [buf_sel.value; counter.value] in
+  let%hw write_address = mux2 (sm.is Set) beams_write_addr write_address_sr.(1).value in
+
   let%hw write_data = mux2 (sm.is Set) data beams_next in
-  let%hw read_address = concat_msb [buf_sel.value; counter.value] in
+  let%hw read_address = concat_msb [~:(buf_sel.value); counter.value] in
 
   beams0 <== dual_port_ram ~clock ~write_address ~write_enable ~write_data ~read_address;
+
+  let shift_write_address () =
+    [ Shift_register.shift write_address_sr beams_write_addr 
+    ; Shift_register.shift last_sr last] |> proc in
 
   (* Advance the pipeline *)
   let advance () =
@@ -123,25 +138,32 @@ let create scope ({ clock; clear; valid; data } : _ I.t) =
   [ sm.switch
     [ (Set,
       [ when_ valid [counter <-- counter.value +:. 1]
-      ; when_ last [sm.set_next Wait]
+      ; when_ last
+        [ counter <--. 0
+        ; buf_sel <-- ~:(buf_sel.value)
+        ; sm.set_next Wait
+        ]
       ])
     ; (Wait,
       [ when_ valid
         [ advance ()
-        ; Shift_register.shift counter_sr counter.value
+        ; shift_write_address ()
         ; counter <-- counter.value +:. 1
-        ; when_ (counter.value ==:. 1) [sm.set_next Run]
+        ; when_ (counter.value ==:. 1)
+          [ sm.set_next Run
+          ]
         ]])
     ; (Run,
       [ when_ valid
         [ counter <-- counter.value +:. 1
         ; prev_bit <-- prev_bit_next
+        ; shift_write_address ()
         ; acc <-- acc.value +: uresize count acc_width
         ; advance ()
         ; when_ last
           [ counter <--. 0
           ; buf_sel <-- ~:(buf_sel.value)
-          ; flush_cnt <--. 2
+          ; flush_cnt <--. 1
           ; sm.set_next Flush
           ]
         ]])
@@ -149,6 +171,7 @@ let create scope ({ clock; clear; valid; data } : _ I.t) =
       [ flush_cnt <-- flush_cnt.value -:. 1
       ; advance ()
       ; acc <-- acc.value +: uresize count acc_width
+      ; shift_write_address ()
       ; prev_bit <-- prev_bit_next
       ; when_ valid [ counter <-- counter.value +:. 1 ]
       ; when_ (flush_cnt.value ==:. 0)
@@ -159,4 +182,8 @@ let create scope ({ clock; clear; valid; data } : _ I.t) =
       ])
     ]
   ] |> compile;
-  { O.out=acc.value; beams_next }
+
+  { O.out=acc.value
+  ; beams_next=mux2 (sm.is Set) data beams_next
+  ; beams_valid=sm.is Run |: sm.is Flush |: (sm.is Set &: valid)
+  }

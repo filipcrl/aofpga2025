@@ -1,5 +1,6 @@
 open Core
 open Hardcaml
+(* open Hardcaml_waveterm *)
 open Adventoffpga
 module Simulator = Cyclesim.With_interface (Laboratories.I) (Laboratories.O)
 
@@ -43,16 +44,14 @@ let bits_of_line line =
 
 let line_of_bits ~line bits =
   String.mapi line ~f:(fun i c ->
-    match Bits.bit bits i |> Bits.is_vdd with
+    match Bits.bit bits (Bits.width bits-i-1) |> Bits.is_vdd with
     | true when Char.(c <> 'S') -> '|'
     | _ -> c)
-
-let bits_of_word word = Bits.of_int ~width:Laboratories.word_width word
 
 let words_of_line ~word_w line =
   let open Bits in
   let bits = bits_of_line line in
-  Format.printf "line=%a @." Bits.pp bits;
+  (*Format.printf "line=%a @." Bits.pp bits;*)
   let num_of_bits = ceil_div (width bits) word_w * word_w in
   let extra = num_of_bits - (width bits) in
   Bits.split_msb ~part_width:word_w (sll (uresize bits num_of_bits) extra)
@@ -64,17 +63,18 @@ let%expect_test "Short input" =
   let oc = Out_channel.create filename in
   let sim = Vcd.wrap oc sim in
   let inputs = Cyclesim.inputs sim in
-  let outputs = Cyclesim.outputs sim in
+  (* Need to sample before the clock edge since beams_valid is combinational *)
+  let outputs = Cyclesim.outputs ~clock_edge:Before sim in
 
   let bits = ref Bits.empty in
   let cycle_ = ref 0 in
   let cycle () =
     cycle_ := !cycle_ + 1;
     Cyclesim.cycle sim;
-    Format.printf "beams_valid [%d] %a @." !cycle_ Bits.pp !(outputs.beams_valid);
+    (* Format.printf "beams_valid [%d] %a @." !cycle_ Bits.pp !(outputs.beams_valid); *)
     if Bits.is_vdd !(outputs.beams_valid) then
-      Format.printf "received [%d] %a @." !cycle_ Bits.pp !(outputs.beams_next);
-      bits := Bits.concat_msb_e [(!bits); !(outputs.beams_next)];
+     ((*Format.printf "received [%d] %a @." !cycle_ Bits.pp !(outputs.beams_next);*)
+      bits := Bits.concat_msb_e [(!bits); !(outputs.beams_next)]);
   in
   inputs.valid := Bits.gnd;
   inputs.clear := Bits.vdd;
@@ -83,8 +83,8 @@ let%expect_test "Short input" =
   inputs.valid := Bits.vdd;
 
   List.iter (strip_and_filter_lines twolines) ~f:(fun line ->
-    List.iter (words_of_line ~word_w:2 line) ~f:(fun word ->
-      Format.printf "%a @." Bits.pp word;
+    List.iter (words_of_line ~word_w:1 line) ~f:(fun word ->
+      (* Format.printf "%a @." Bits.pp word; *)
       inputs.data := word;
       cycle ()));
 
@@ -93,38 +93,87 @@ let%expect_test "Short input" =
   (* wait for flush *)
   for _ = 1 to 3 do cycle () done;
 
-  Format.printf "all bits[%d]=%a @." (Bits.width !bits) Bits.pp !bits;
-  let _beams = Bits.split_msb ~exact:false ~part_width:6 !bits in
-  (* List.iter (beams) ~f:(Format.printf "%a @." Bits.pp); *)
+  (*Format.printf "all bits[%d]=%a @." (Bits.width !bits) Bits.pp !bits;*)
+  let beams = Bits.split_msb ~exact:false ~part_width:5 !bits in
+  (*List.iter (beams) ~f:(Format.printf "%a @." Bits.pp);*)
 
-  (* List.iter (List.zip_exn (strip_and_filter_lines twolines) beams) ~f:(fun (line, beams) ->
-    print_endline (line_of_bits ~line beams)); *)
+  List.iter (List.zip_exn (strip_and_filter_lines twolines) beams) ~f:(fun (line, beams) ->
+    (*Format.printf "line=%s beam=%a @." line Bits.pp beams;*)
+    print_endline (line_of_bits ~line beams));
 
   let result = Bits.to_int !(outputs.out) in
   Format.printf "result=%u@." result;
   Out_channel.flush oc;
   [%expect {|
+    ..S..
+    .|^|.
+    |^||.
+    |.||^
+    result=2
     |}]
 
-let%expect_test "Line input after clear, waveform capture" =
+(* let%expect_test "Line input after clear, waveform capture" =
   let scope = Scope.create ~flatten_design:false () in
   let sim = Simulator.create ~config:(Cyclesim.Config.trace `All_named) (Laboratories.create scope) in
-  let filename = "/tmp/laboratories.vcd" in
-  let oc = Out_channel.create filename in
-  let sim = Vcd.wrap oc sim in
+  let waves, sim = Waveform.create sim in
   let inputs = Cyclesim.inputs sim in
-  let cycle () = Cyclesim.cycle sim in
+  let outputs_before = Cyclesim.outputs ~clock_edge:Before sim in
+  let n = ref 0 in
+  let cycle () =
+    Cyclesim.cycle_before_clock_edge sim;
+    Format.printf
+      "%d v=%a d=%a bv=%a bn=%a @."
+      !n
+      Bits.pp
+      !(inputs.valid)
+      Bits.pp
+      !(inputs.data)
+      Bits.pp
+      !(outputs_before.beams_valid)
+      Bits.pp
+      !(outputs_before.beams_next);
+    Cyclesim.cycle_at_clock_edge sim;
+    n := !n + 1;
+    Cyclesim.cycle_after_clock_edge sim;
+  in
   inputs.valid := Bits.gnd;
   inputs.clear := Bits.vdd;
   cycle ();
   inputs.clear := Bits.gnd;
   inputs.valid := Bits.vdd;
-  inputs.data := bits_of_word 1;
-  cycle ();
-  inputs.data := bits_of_word 2;
-  cycle ();
+  let bits = words_of_line ~word_w:2 "..S.." in
+  List.iter bits ~f:(fun word ->
+    inputs.data := word;
+    cycle ());
   inputs.valid := Bits.gnd;
   cycle ();
-  Out_channel.close oc;
+  Waveform.print waves;
   [%expect {|
+    0 v=0 d=00 bv=0 bn=00
+    line=00100
+    1 v=1 d=00 bv=1 bn=00
+    2 v=1 d=10 bv=1 bn=10
+    3 v=1 d=00 bv=1 bn=00
+    4 v=0 d=00 bv=0 bn=00
+    ┌Signals────────┐┌Waves──────────────────────────────────────────────┐
+    │clock          ││┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌──│
+    │               ││    └───┘   └───┘   └───┘   └───┘   └───┘   └───┘  │
+    │clear          ││────────┐                                          │
+    │               ││        └───────────────────────────────           │
+    │               ││────────────────┬───────┬───────────────           │
+    │data           ││ 0              │2      │0                         │
+    │               ││────────────────┴───────┴───────────────           │
+    │valid          ││        ┌───────────────────────┐                  │
+    │               ││────────┘                       └───────           │
+    │               ││────────────────┬───────┬───────────────           │
+    │beams_next     ││ 0              │2      │0                         │
+    │               ││────────────────┴───────┴───────────────           │
+    │beams_valid    ││        ┌───────────────────────┐                  │
+    │               ││────────┘                       └───────           │
+    │               ││────────────────────────────────────────           │
+    │out            ││ 00                                                │
+    │               ││────────────────────────────────────────           │
+    │               ││────────────────────────────────────────           │
+    └───────────────┘└───────────────────────────────────────────────────┘
     |}]
+*)
