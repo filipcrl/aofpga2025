@@ -54,20 +54,14 @@ module Make (Config : Config) = struct
     let beams_next = linenosplit |: split_left |: split_right in
     beams_next, bit hits 0, popcount hits
 
-  (** Will store the ram and *)
   let dual_port_ram ~clock ~write_address ~write_enable ~write_data ~read_address =
-    let spec = Reg_spec.create ~clock () in
-    (multiport_memory
-      Int.(2 ** (width write_address))
-      ~write_ports:
-        [| { write_clock = clock
-            ; write_enable
-            ; write_address
-            ; write_data
-            }
-        |]
-      ~read_addresses:[| read_address |]).(0)
-    |> reg spec
+    Ram.create
+      ~collision_mode:Ram.Collision_mode.Write_before_read
+      ~size:Int.(2 ** (width write_address))
+      ~write_ports:[| { write_clock = clock; write_enable; write_address; write_data } |]
+      ~read_ports:[| { read_clock=clock; read_address; read_enable=vdd } |]
+      ()
+    |> fun a -> a.(0)
 
   module Shift_register = struct
     type t = Always.Variable.t array
@@ -139,6 +133,13 @@ module Make (Config : Config) = struct
       ; beams1 <-- beams0
       ] |> proc in
 
+    let flush () =
+      [ counter <--. 0
+      ; buf_sel <-- ~:(buf_sel.value)
+      ; flush_cnt <--. 1
+      ; sm.set_next Flush
+      ] |> proc in
+
     [ sm.switch
       [ (Set,
         [ when_ valid [
@@ -147,7 +148,9 @@ module Make (Config : Config) = struct
             [ counter <--. 0
             ; buf_sel <-- ~:(buf_sel.value)
             ; sm.set_next Wait
-            ]]])
+            ]
+          ]
+        ])
       ; (Wait,
         [ when_ valid
           [ advance ()
@@ -155,9 +158,9 @@ module Make (Config : Config) = struct
           ; counter <-- counter.value +:. 1
           ; read_addr_delayed <-- beams_read_addr
           ; when_ (counter.value ==:. 1)
-            [ sm.set_next Run
-            ]
-          ]])
+            [ if_ last [flush ()] [sm.set_next Run] ]
+          ]
+        ])
       ; (Run,
         [ when_ valid
           [ counter <-- counter.value +:. 1
@@ -166,13 +169,9 @@ module Make (Config : Config) = struct
           ; read_addr_delayed <-- beams_read_addr
           ; acc <-- acc.value +: uresize count acc_w
           ; advance ()
-          ; when_ last
-            [ counter <--. 0
-            ; buf_sel <-- ~:(buf_sel.value)
-            ; flush_cnt <--. 1
-            ; sm.set_next Flush
-            ]
-          ]])
+          ; when_ last [flush()]
+          ]
+        ])
       ; (Flush,
         [ flush_cnt <-- flush_cnt.value -:. 1
         ; advance ()
@@ -185,11 +184,9 @@ module Make (Config : Config) = struct
           ]
         ; when_ (flush_cnt.value ==:. 0)
           [ if_ (valid &&: counter.value ==:. 1)
-            [sm.set_next Run]
+            [if_ (last) [flush ()] [sm.set_next Run] ]
             [sm.set_next Wait]
-          ]
-        ])
-      ]
+          ]])]
     ] |> compile;
 
     { O.out=acc.value

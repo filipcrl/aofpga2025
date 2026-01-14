@@ -11,6 +11,12 @@ module Dut1x5 = Laboratories.Make (struct
   let acc_w = 4
 end)
 
+module Dut3x2 = Laboratories.Make (struct
+  let word_w = 3
+  let line_w = 5
+  let acc_w = 4
+end)
+
 let aocexample = {|
 .......S.......
 ...............
@@ -62,8 +68,8 @@ let words_of_line ~word_w line =
 
 let%expect_test "short input, 2 clock gap" =
   let scope = Scope.create ~flatten_design:false () in
-  let module Simulator = Cyclesim.With_interface (Dut1x5.I) (Dut1x5.O) in
-  let sim = Simulator.create ~config:Cyclesim.Config.trace_all (Dut1x5.create scope) in
+  let module Simulator = Cyclesim.With_interface (Dut3x2.I) (Dut3x2.O) in
+  let sim = Simulator.create ~config:Cyclesim.Config.trace_all (Dut3x2.create scope) in
   let filename = "/tmp/short_input.vcd" in
   let oc = Out_channel.create filename in
   let sim = Vcd.wrap oc sim in
@@ -88,15 +94,15 @@ let%expect_test "short input, 2 clock gap" =
   inputs.valid := Bits.vdd;
 
   List.iter (strip_and_filter_lines twolines) ~f:(fun line ->
-    List.iter (words_of_line ~word_w:1 line) ~f:(fun word ->
+    List.iter (words_of_line ~word_w:3 line) ~f:(fun word ->
       (* Format.printf "%a @." Bits.pp word; *)
       inputs.valid := Bits.vdd; 
       inputs.data := word;
       cycle ();
-      inputs.valid := Bits.gnd; 
+      inputs.valid := Bits.gnd;
       cycle ();
-      cycle ();
-      cycle ()));
+      cycle ()
+      ));
 
   inputs.valid := Bits.gnd;
 
@@ -104,7 +110,7 @@ let%expect_test "short input, 2 clock gap" =
   for _ = 1 to 3 do cycle () done;
 
   Format.printf "all bits[%d]=%a @." (Bits.width !bits) Bits.pp !bits;
-  let beams = Bits.split_msb ~exact:false ~part_width:5 !bits in
+  let beams = Bits.split_msb ~exact:false ~part_width:6 !bits in
   List.iter (beams) ~f:(Format.printf "%a @." Bits.pp);
 
   List.iter (List.zip_exn (strip_and_filter_lines twolines) beams) ~f:(fun (line, beams) ->
