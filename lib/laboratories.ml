@@ -96,7 +96,7 @@ module Make (Config : Config) = struct
     let%hw_var acc = Variable.reg ~width:acc_w spec in
     let%hw_var counter = Variable.reg ~width:counter_w spec in
 
-    let%hw_var flush_cnt = Variable.reg ~width:2 spec in
+    let%hw_var flush_cnt = Variable.reg ~width:1 spec in
 
     let splitters = Shift_register.create ~name:"splitters" ~width:word_w ~n:2 spec in
     let%hw_var beams1 = Variable.reg ~width:word_w spec in
@@ -116,12 +116,15 @@ module Make (Config : Config) = struct
       ~last:last_sr.(1).value ~beams:(beams1.value, beams0)
       ~splitters:(splitters.(1).value, splitters.(0).value) ~prev_bit:prev_bit.value in
 
-    let%hw write_enable = ~:(sm.is Wait) in
+    let%hw write_enable = sm.is Flush |: (sm.is Run |: sm.is Set &: valid) in
     let beams_write_addr = concat_msb [buf_sel.value; counter.value] in
     let%hw write_address = mux2 (sm.is Set) beams_write_addr write_address_sr.(1).value in
 
     let%hw write_data = mux2 (sm.is Set) data beams_next in
-    let%hw read_address = concat_msb [~:(buf_sel.value); counter.value] in
+    let beams_read_addr = concat_msb [~:(buf_sel.value); counter.value] in
+    let read_addr_delayed = Variable.reg ~width:(counter_w+1) spec in
+
+    let%hw read_address = mux2 valid beams_read_addr read_addr_delayed.value in
 
     beams0 <== dual_port_ram ~clock ~write_address ~write_enable ~write_data ~read_address;
 
@@ -138,18 +141,19 @@ module Make (Config : Config) = struct
 
     [ sm.switch
       [ (Set,
-        [ when_ valid [counter <-- counter.value +:. 1]
-        ; when_ last
-          [ counter <--. 0
-          ; buf_sel <-- ~:(buf_sel.value)
-          ; sm.set_next Wait
-          ]
-        ])
+        [ when_ valid [
+          counter <-- counter.value +:. 1
+          ; when_ last
+            [ counter <--. 0
+            ; buf_sel <-- ~:(buf_sel.value)
+            ; sm.set_next Wait
+            ]]])
       ; (Wait,
         [ when_ valid
           [ advance ()
           ; shift_write_address ()
           ; counter <-- counter.value +:. 1
+          ; read_addr_delayed <-- beams_read_addr
           ; when_ (counter.value ==:. 1)
             [ sm.set_next Run
             ]
@@ -159,6 +163,7 @@ module Make (Config : Config) = struct
           [ counter <-- counter.value +:. 1
           ; prev_bit <-- prev_bit_next
           ; shift_write_address ()
+          ; read_addr_delayed <-- beams_read_addr
           ; acc <-- acc.value +: uresize count acc_w
           ; advance ()
           ; when_ last
@@ -174,7 +179,10 @@ module Make (Config : Config) = struct
         ; acc <-- acc.value +: uresize count acc_w
         ; shift_write_address ()
         ; prev_bit <-- prev_bit_next
-        ; when_ valid [ counter <-- counter.value +:. 1 ]
+        ; when_ valid
+          [ counter <-- counter.value +:. 1
+          ; read_addr_delayed <-- beams_read_addr
+          ]
         ; when_ (flush_cnt.value ==:. 0)
           [ if_ (valid &&: counter.value ==:. 1)
             [sm.set_next Run]
@@ -186,6 +194,6 @@ module Make (Config : Config) = struct
 
     { O.out=acc.value
     ; beams_next=mux2 (sm.is Set) data beams_next
-    ; beams_valid=sm.is Run |: sm.is Flush |: (sm.is Set &: valid)
+    ; beams_valid=write_enable
     }
 end

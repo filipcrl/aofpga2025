@@ -60,7 +60,7 @@ let words_of_line ~word_w line =
   let extra = num_of_bits - (width bits) in
   Bits.split_msb ~part_width:word_w (sll (uresize bits num_of_bits) extra)
 
-let%expect_test "short input, no gaps" =
+let%expect_test "short input, 2 clock gap" =
   let scope = Scope.create ~flatten_design:false () in
   let module Simulator = Cyclesim.With_interface (Dut1x5.I) (Dut1x5.O) in
   let sim = Simulator.create ~config:Cyclesim.Config.trace_all (Dut1x5.create scope) in
@@ -90,7 +90,12 @@ let%expect_test "short input, no gaps" =
   List.iter (strip_and_filter_lines twolines) ~f:(fun line ->
     List.iter (words_of_line ~word_w:1 line) ~f:(fun word ->
       (* Format.printf "%a @." Bits.pp word; *)
+      inputs.valid := Bits.vdd; 
       inputs.data := word;
+      cycle ();
+      inputs.valid := Bits.gnd; 
+      cycle ();
+      cycle ();
       cycle ()));
 
   inputs.valid := Bits.gnd;
@@ -98,9 +103,9 @@ let%expect_test "short input, no gaps" =
   (* wait for flush *)
   for _ = 1 to 3 do cycle () done;
 
-  (*Format.printf "all bits[%d]=%a @." (Bits.width !bits) Bits.pp !bits;*)
+  Format.printf "all bits[%d]=%a @." (Bits.width !bits) Bits.pp !bits;
   let beams = Bits.split_msb ~exact:false ~part_width:5 !bits in
-  (*List.iter (beams) ~f:(Format.printf "%a @." Bits.pp);*)
+  List.iter (beams) ~f:(Format.printf "%a @." Bits.pp);
 
   List.iter (List.zip_exn (strip_and_filter_lines twolines) beams) ~f:(fun (line, beams) ->
     (*Format.printf "line=%s beam=%a @." line Bits.pp beams;*)
@@ -132,6 +137,43 @@ let capture_lines sim out beams_valid beams_next ~f =
 
   let result = Bits.to_int !out in
   Format.printf "result=%u@." result
+
+let%expect_test "short input, 1 cycle gap" =
+  let scope = Scope.create ~flatten_design:false () in
+  let module Simulator = Cyclesim.With_interface (Dut1x5.I) (Dut1x5.O) in
+  let sim = Simulator.create ~config:Cyclesim.Config.trace_all (Dut1x5.create scope) in
+  let inputs = Cyclesim.inputs sim in
+  (* Need to sample before the clock edge since beams_valid is combinational *)
+  let outputs = Cyclesim.outputs ~clock_edge:Before sim in
+
+  capture_lines sim outputs.out outputs.beams_valid outputs.beams_next
+    ~f:(fun cycle ->
+      inputs.valid := Bits.gnd;
+      inputs.clear := Bits.vdd;
+      cycle ();
+      inputs.clear := Bits.gnd;
+      inputs.valid := Bits.vdd;
+
+      List.iter (strip_and_filter_lines twolines) ~f:(fun line ->
+        List.iter (words_of_line ~word_w:1 line) ~f:(fun word ->
+          (* Format.printf "%a @." Bits.pp word; *)
+          inputs.valid := Bits.vdd;
+          inputs.data := word;
+          cycle ();
+          inputs.valid := Bits.gnd;
+          cycle ()));
+
+      inputs.valid := Bits.gnd;
+
+      (* wait for flush *)
+      for _ = 1 to 3 do cycle () done);
+  [%expect {|
+    ..S..
+    .|^|.
+    |^||.
+    |.||^
+    result=2
+    |}]
 
 let%expect_test "short input, no gaps" =
   let scope = Scope.create ~flatten_design:false () in
