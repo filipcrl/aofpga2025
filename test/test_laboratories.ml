@@ -1,42 +1,35 @@
 open Core
 open Hardcaml
-(* open Hardcaml_waveterm *)
 open Adventoffpga
 
 let ceil_div a b = 1 + ((a - 1) / b) 
 
-module Dut1x5 = Laboratories.Make (struct
+module Short_dut_1b = Laboratories.Make (struct
   let word_w = 1
   let line_w = 5
   let acc_w = 4
 end)
 
-module Dut3x2 = Laboratories.Make (struct
+module Short_dut_2b = Laboratories.Make (struct
+  let word_w = 2
+  let line_w = 5
+  let acc_w = 4
+end)
+
+module Short_dut_3b = Laboratories.Make (struct
   let word_w = 3
   let line_w = 5
   let acc_w = 4
 end)
 
-let aocexample = {|
-.......S.......
-...............
-.......^.......
-...............
-......^.^......
-...............
-.....^.^.^.....
-...............
-....^.^...^....
-...............
-...^.^...^.^...
-...............
-..^...^.....^..
-...............
-.^.^.^.^.^...^.
-...............
-|}
+module Big_dut_64b = Laboratories.Make (struct
+  let word_w = 64
+  let line_w = 141
+  let acc_w = 32
+end)
 
-let twolines = {|
+let short_input =
+  {|
 ..S..
 ..^..
 .^...
@@ -59,224 +52,292 @@ let line_of_bits ~line bits =
     | true when Char.(c <> 'S') -> '|'
     | _ -> c)
 
-let words_of_line ~word_w line =
+let padded_line_w ~line_w ~word_w = ceil_div line_w word_w * word_w
+
+let words_of_line ~line_w ~word_w line =
   let open Bits in
+  let line = String.strip line in
+  if String.length line <> line_w
+  then
+    raise_s
+      [%message
+        "Line length doesn't match expected width"
+          (line_w : int)
+          (String.length line : int)
+          (line : string)];
   let bits = bits_of_line line in
-  let num_of_bits = ceil_div (width bits) word_w * word_w in
-  let extra = num_of_bits - (width bits) in
-  Bits.split_msb ~part_width:word_w (sll (uresize bits num_of_bits) extra)
+  let padded_w = padded_line_w ~line_w ~word_w in
+  let extra = padded_w - width bits in
+  Bits.split_msb ~part_width:word_w (sll (uresize bits padded_w) extra)
 
-let%expect_test "short input, 2 clock gap" =
-  let scope = Scope.create ~flatten_design:false () in
-  let module Simulator = Cyclesim.With_interface (Dut3x2.I) (Dut3x2.O) in
-  let sim = Simulator.create ~config:Cyclesim.Config.trace_all (Dut3x2.create scope) in
-  let filename = "/tmp/short_input.vcd" in
-  let oc = Out_channel.create filename in
-  let sim = Vcd.wrap oc sim in
-  let inputs = Cyclesim.inputs sim in
-  (* Need to sample before the clock edge since beams_valid is combinational *)
-  let outputs = Cyclesim.outputs ~clock_edge:Before sim in
+type gap =
+  | Fixed of int
+  | Random of
+      { seed : int
+      ; max_gap : int
+      }
 
-  let bits = ref Bits.empty in
-  let cycle_ = ref 0 in
-  let cycle () =
-    cycle_ := !cycle_ + 1;
-    Cyclesim.cycle sim;
-    (* Format.printf "beams_valid [%d] %a @." !cycle_ Bits.pp !(outputs.beams_valid); *)
-    if Bits.is_vdd !(outputs.beams_valid) then
-     ((*Format.printf "received [%d] %a @." !cycle_ Bits.pp !(outputs.beams_next);*)
-      bits := Bits.concat_msb_e [(!bits); !(outputs.beams_next)]);
+let next_gap_fn = function
+  | Fixed n ->
+    if n < 0 then invalid_arg "gap must be >= 0";
+    fun () -> n
+  | Random { seed; max_gap } ->
+    if max_gap < 0 then invalid_arg "max_gap must be >= 0";
+    let rng = Random.State.make [| seed |] in
+    fun () -> Random.State.int rng (max_gap + 1)
+
+let simulate_and_capture
+  (module Dut : Laboratories_intf.S)
+  ~word_w
+  ~line_w
+  ~lines
+  ~gap
+  =
+  let words =
+    List.concat_map lines ~f:(fun line -> words_of_line ~line_w ~word_w line)
   in
-  inputs.valid := Bits.gnd;
-  inputs.clear := Bits.vdd;
-  cycle ();
-  inputs.clear := Bits.gnd;
-  inputs.valid := Bits.vdd;
+  let expected_words = List.length words in
 
-  List.iter (strip_and_filter_lines twolines) ~f:(fun line ->
-    List.iter (words_of_line ~word_w:3 line) ~f:(fun word ->
-      (* Format.printf "%a @." Bits.pp word; *)
-      inputs.valid := Bits.vdd; 
-      inputs.data := word;
-      cycle ();
-      inputs.valid := Bits.gnd;
-      cycle ();
-      cycle ()
-      ));
-
-  inputs.valid := Bits.gnd;
-
-  (* wait for flush *)
-  for _ = 1 to 3 do cycle () done;
-
-  Format.printf "all bits[%d]=%a @." (Bits.width !bits) Bits.pp !bits;
-  let beams = Bits.split_msb ~exact:false ~part_width:6 !bits in
-  List.iter (beams) ~f:(Format.printf "%a @." Bits.pp);
-
-  List.iter (List.zip_exn (strip_and_filter_lines twolines) beams) ~f:(fun (line, beams) ->
-    (*Format.printf "line=%s beam=%a @." line Bits.pp beams;*)
-    print_endline (line_of_bits ~line beams));
-
-  let result = Bits.to_int !(outputs.out) in
-  Format.printf "result=%u@." result;
-  Out_channel.flush oc;
-  [%expect {|
-    ..S..
-    .|^|.
-    |^||.
-    |.||^
-    result=2
-    |}]
-  
-let capture_lines sim out beams_valid beams_next ~f =
-  let bits = ref Bits.empty in
-  let cycle () =
-    Cyclesim.cycle sim;
-    if Bits.is_vdd !beams_valid then
-      bits := Bits.concat_msb_e [!bits; !beams_next] in
-
-  f cycle;
-
-  let beams = Bits.split_msb ~exact:false ~part_width:5 !bits in
-  List.iter (List.zip_exn (strip_and_filter_lines twolines) beams) ~f:(fun (line, beams) ->
-    print_endline (line_of_bits ~line beams));
-
-  let result = Bits.to_int !out in
-  Format.printf "result=%u@." result
-
-let%expect_test "short input, 1 cycle gap" =
   let scope = Scope.create ~flatten_design:false () in
-  let module Simulator = Cyclesim.With_interface (Dut1x5.I) (Dut1x5.O) in
-  let sim = Simulator.create ~config:Cyclesim.Config.trace_all (Dut1x5.create scope) in
-  let inputs = Cyclesim.inputs sim in
-  (* Need to sample before the clock edge since beams_valid is combinational *)
-  let outputs = Cyclesim.outputs ~clock_edge:Before sim in
-
-  capture_lines sim outputs.out outputs.beams_valid outputs.beams_next
-    ~f:(fun cycle ->
-      inputs.valid := Bits.gnd;
-      inputs.clear := Bits.vdd;
-      cycle ();
-      inputs.clear := Bits.gnd;
-      inputs.valid := Bits.vdd;
-
-      List.iter (strip_and_filter_lines twolines) ~f:(fun line ->
-        List.iter (words_of_line ~word_w:1 line) ~f:(fun word ->
-          (* Format.printf "%a @." Bits.pp word; *)
-          inputs.valid := Bits.vdd;
-          inputs.data := word;
-          cycle ();
-          inputs.valid := Bits.gnd;
-          cycle ()));
-
-      inputs.valid := Bits.gnd;
-
-      (* wait for flush *)
-      for _ = 1 to 3 do cycle () done);
-  [%expect {|
-    ..S..
-    .|^|.
-    |^||.
-    |.||^
-    result=2
-    |}]
-
-let%expect_test "short input, no gaps" =
-  let scope = Scope.create ~flatten_design:false () in
-  let module Simulator = Cyclesim.With_interface (Dut1x5.I) (Dut1x5.O) in
-  let sim = Simulator.create ~config:Cyclesim.Config.trace_all (Dut1x5.create scope) in
-  let inputs = Cyclesim.inputs sim in
-  (* Need to sample before the clock edge since beams_valid is combinational *)
-  let outputs = Cyclesim.outputs ~clock_edge:Before sim in
-
-  capture_lines sim outputs.out outputs.beams_valid outputs.beams_next
-    ~f:(fun cycle ->
-      inputs.valid := Bits.gnd;
-      inputs.clear := Bits.vdd;
-      cycle ();
-      inputs.clear := Bits.gnd;
-      inputs.valid := Bits.vdd;
-
-      List.iter (strip_and_filter_lines twolines) ~f:(fun line ->
-        List.iter (words_of_line ~word_w:1 line) ~f:(fun word ->
-          (* Format.printf "%a @." Bits.pp word; *)
-          inputs.data := word;
-          cycle ()));
-
-      inputs.valid := Bits.gnd;
-
-      (* wait for flush *)
-      for _ = 1 to 3 do cycle () done);
-  [%expect {|
-    ..S..
-    .|^|.
-    |^||.
-    |.||^
-    result=2
-    |}]
-
-(* let%expect_test "Line input after clear, waveform capture" =
-  let scope = Scope.create ~flatten_design:false () in
-  let sim = Simulator.create ~config:(Cyclesim.Config.trace `All_named) (Laboratories.create scope) in
-  let waves, sim = Waveform.create sim in
+  let module Simulator = Cyclesim.With_interface (Dut.I) (Dut.O) in
+  let sim = Simulator.create (Dut.create scope) in
   let inputs = Cyclesim.inputs sim in
   let outputs_before = Cyclesim.outputs ~clock_edge:Before sim in
-  let n = ref 0 in
-  let cycle () =
-    Cyclesim.cycle_before_clock_edge sim;
-    Format.printf
-      "%d v=%a d=%a bv=%a bn=%a @."
-      !n
-      Bits.pp
-      !(inputs.valid)
-      Bits.pp
-      !(inputs.data)
-      Bits.pp
-      !(outputs_before.beams_valid)
-      Bits.pp
-      !(outputs_before.beams_next);
-    Cyclesim.cycle_at_clock_edge sim;
-    n := !n + 1;
-    Cyclesim.cycle_after_clock_edge sim;
+  let outputs_after = Cyclesim.outputs sim in
+
+  let captured_words_rev = ref [] in
+  let captured_word_count = ref 0 in
+  let capture_if_ready () =
+    if !captured_word_count < expected_words
+       && Bits.is_vdd !(outputs_before.beams_valid)
+    then (
+      captured_words_rev := !(outputs_before.beams_next) :: !captured_words_rev;
+      incr captured_word_count)
   in
+  let cycle () =
+    Cyclesim.cycle sim;
+    capture_if_ready ()
+  in
+
+  let next_gap = next_gap_fn gap in
+
   inputs.valid := Bits.gnd;
   inputs.clear := Bits.vdd;
+  inputs.data := Bits.zero word_w;
   cycle ();
   inputs.clear := Bits.gnd;
-  inputs.valid := Bits.vdd;
-  let bits = words_of_line ~word_w:2 "..S.." in
-  List.iter bits ~f:(fun word ->
+
+  List.iter words ~f:(fun word ->
+    inputs.valid := Bits.vdd;
     inputs.data := word;
-    cycle ());
+    cycle ();
+    inputs.valid := Bits.gnd;
+    for _ = 1 to next_gap () do
+      cycle ()
+    done);
+
   inputs.valid := Bits.gnd;
-  cycle ();
-  Waveform.print waves;
+
+  (* Flush until we have the full output, then wait for the design to go quiet. *)
+  let quiet_cycles_required = 10 in
+  let quiet_cycles = ref 0 in
+  let max_cycles_after_input = expected_words * 100 + 1_000 in
+  let cycles_after_input = ref 0 in
+  while
+    !cycles_after_input < max_cycles_after_input
+    && (!captured_word_count < expected_words || !quiet_cycles < quiet_cycles_required)
+  do
+    incr cycles_after_input;
+    cycle ();
+    if Bits.is_vdd !(outputs_before.beams_valid)
+    then quiet_cycles := 0
+    else incr quiet_cycles
+  done;
+
+  if !captured_word_count <> expected_words
+  then
+    raise_s
+      [%message
+        "Timed out waiting for expected output words"
+          (expected_words : int)
+          (!captured_word_count : int)
+          (max_cycles_after_input : int)];
+
+  if !quiet_cycles < quiet_cycles_required
+  then
+    raise_s
+      [%message
+        "Timed out waiting for the design to go quiet"
+          (quiet_cycles_required : int)
+          (!quiet_cycles : int)
+          (max_cycles_after_input : int)];
+
+  let captured_words = List.rev !captured_words_rev in
+  let beams_bits =
+    match captured_words with
+    | [] -> Bits.empty
+    | _ -> Bits.concat_msb captured_words
+  in
+  let result = Bits.to_int !(outputs_after.out) in
+  beams_bits, result
+
+let run_short_input
+  (module Dut : Laboratories_intf.S)
+  ~word_w
+  ~gap
+  =
+  let lines = strip_and_filter_lines short_input in
+  let beams_bits, result =
+    simulate_and_capture (module Dut) ~word_w ~line_w:5 ~lines ~gap
+  in
+  let beams =
+    Bits.split_msb ~part_width:(padded_line_w ~line_w:5 ~word_w) beams_bits
+  in
+  List.iter (List.zip_exn lines beams) ~f:(fun (line, bits) ->
+    print_endline (line_of_bits ~line bits));
+  printf "result=%d\n" result
+
+let run_bigtest
+  (module Dut : Laboratories_intf.S)
+  ~word_w
+  ~gap
+  =
+  let sourceroot = Sys.getenv_exn "DUNE_SOURCEROOT" in
+  let bigtest_path = Filename.concat sourceroot "test/bigtest.txt" in
+  let lines = In_channel.read_all bigtest_path |> strip_and_filter_lines in
+  let _beams_bits, result =
+    simulate_and_capture (module Dut) ~word_w ~line_w:141 ~lines ~gap
+  in
+  printf "result=%d\n" result
+
+let%expect_test "short input, 1b word, gap 0" =
+  run_short_input (module Short_dut_1b) ~word_w:1 ~gap:(Fixed 0);
   [%expect {|
-    0 v=0 d=00 bv=0 bn=00
-    line=00100
-    1 v=1 d=00 bv=1 bn=00
-    2 v=1 d=10 bv=1 bn=10
-    3 v=1 d=00 bv=1 bn=00
-    4 v=0 d=00 bv=0 bn=00
-    ┌Signals────────┐┌Waves──────────────────────────────────────────────┐
-    │clock          ││┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌──│
-    │               ││    └───┘   └───┘   └───┘   └───┘   └───┘   └───┘  │
-    │clear          ││────────┐                                          │
-    │               ││        └───────────────────────────────           │
-    │               ││────────────────┬───────┬───────────────           │
-    │data           ││ 0              │2      │0                         │
-    │               ││────────────────┴───────┴───────────────           │
-    │valid          ││        ┌───────────────────────┐                  │
-    │               ││────────┘                       └───────           │
-    │               ││────────────────┬───────┬───────────────           │
-    │beams_next     ││ 0              │2      │0                         │
-    │               ││────────────────┴───────┴───────────────           │
-    │beams_valid    ││        ┌───────────────────────┐                  │
-    │               ││────────┘                       └───────           │
-    │               ││────────────────────────────────────────           │
-    │out            ││ 00                                                │
-    │               ││────────────────────────────────────────           │
-    │               ││────────────────────────────────────────           │
-    └───────────────┘└───────────────────────────────────────────────────┘
+    ..S..
+    .|^|.
+    |^||.
+    |.||^
+    result=2
     |}]
-*)
+
+let%expect_test "short input, 1b word, gap 1" =
+  run_short_input (module Short_dut_1b) ~word_w:1 ~gap:(Fixed 1);
+  [%expect {|
+    ..S..
+    .|^|.
+    |^||.
+    |.||^
+    result=2
+    |}]
+
+let%expect_test "short input, 1b word, gap 2" =
+  run_short_input (module Short_dut_1b) ~word_w:1 ~gap:(Fixed 2);
+  [%expect {|
+    ..S..
+    .|^|.
+    |^||.
+    |.||^
+    result=2
+    |}]
+
+let%expect_test "short input, 1b word, seeded random gap" =
+  run_short_input (module Short_dut_1b) ~word_w:1 ~gap:(Random { seed = 123; max_gap = 2 });
+  [%expect {|
+    ..S..
+    .|^|.
+    |^||.
+    |.||^
+    result=2
+    |}]
+
+let%expect_test "short input, 2b word, gap 0" =
+  run_short_input (module Short_dut_2b) ~word_w:2 ~gap:(Fixed 0);
+  [%expect {|
+    ..S..
+    .|^|.
+    |^||.
+    |.||^
+    result=2
+    |}]
+
+let%expect_test "short input, 2b word, gap 1" =
+  run_short_input (module Short_dut_2b) ~word_w:2 ~gap:(Fixed 1);
+  [%expect {|
+    ..S..
+    .|^|.
+    |^||.
+    |.||^
+    result=2
+    |}]
+
+let%expect_test "short input, 2b word, gap 2" =
+  run_short_input (module Short_dut_2b) ~word_w:2 ~gap:(Fixed 2);
+  [%expect {|
+    ..S..
+    .|^|.
+    |^||.
+    |.||^
+    result=2
+    |}]
+
+let%expect_test "short input, 2b word, seeded random gap" =
+  run_short_input (module Short_dut_2b) ~word_w:2 ~gap:(Random { seed = 123; max_gap = 2 });
+  [%expect {|
+    ..S..
+    .|^|.
+    |^||.
+    |.||^
+    result=2
+    |}]
+
+let%expect_test "short input, 3b word, gap 0" =
+  run_short_input (module Short_dut_3b) ~word_w:3 ~gap:(Fixed 0);
+  [%expect {|
+    ..S..
+    .|^|.
+    |^||.
+    |.||^
+    result=2
+    |}]
+
+let%expect_test "short input, 3b word, gap 1" =
+  run_short_input (module Short_dut_3b) ~word_w:3 ~gap:(Fixed 1);
+  [%expect {|
+    ..S..
+    .|^|.
+    |^||.
+    |.||^
+    result=2
+    |}]
+
+let%expect_test "short input, 3b word, gap 2" =
+  run_short_input (module Short_dut_3b) ~word_w:3 ~gap:(Fixed 2);
+  [%expect {|
+    ..S..
+    .|^|.
+    |^||.
+    |.||^
+    result=2
+    |}]
+
+let%expect_test "short input, 3b word, seeded random gap" =
+  run_short_input (module Short_dut_3b) ~word_w:3 ~gap:(Random { seed = 123; max_gap = 2 });
+  [%expect {|
+    ..S..
+    .|^|.
+    |^||.
+    |.||^
+    result=2
+    |}]
+
+let%expect_test "bigtest, 64b word" =
+  run_bigtest (module Big_dut_64b) ~word_w:64 ~gap:(Fixed 0);
+  run_bigtest (module Big_dut_64b) ~word_w:64 ~gap:(Fixed 1);
+  run_bigtest (module Big_dut_64b) ~word_w:64 ~gap:(Fixed 2);
+  run_bigtest (module Big_dut_64b) ~word_w:64 ~gap:(Random { seed = 123; max_gap = 3 });
+  [%expect {|
+    result=1587
+    result=1587
+    result=1587
+    result=1123
+    |}]

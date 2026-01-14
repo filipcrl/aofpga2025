@@ -1,0 +1,6 @@
+_build/
+_opam/
+.vscode/
+_reports/
+
+vivado*
