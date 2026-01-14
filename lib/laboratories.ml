@@ -2,15 +2,12 @@ open Core
 open Hardcaml
 open Hardcaml.Signal
 
+include Laboratories_intf
+
 let ceil_div a b = 1 + ((a - 1) / b) 
 
-module type Config = sig
-  val word_w : int
-  val line_w : int
-  val acc_w  : int
-end
-
 module Make (Config : Config) = struct
+  module Config = Config
   open Config 
 
   let counter_max = ceil_div line_w word_w
@@ -75,7 +72,7 @@ module Make (Config : Config) = struct
   module Shift_register = struct
     type t = Always.Variable.t array
 
-    let create ?name ~width ~n spec =
+    let create ?name ~width ~n spec : t =
       Array.init n ~f:(fun i ->
         let reg = Always.Variable.reg ~width spec in
         (match name with
@@ -83,7 +80,7 @@ module Make (Config : Config) = struct
         | None -> ());
         reg)
 
-    let shift t data =
+    let shift (t : t) data =
       let open Always in
       Array.mapi t ~f:(fun i reg ->
         match i with

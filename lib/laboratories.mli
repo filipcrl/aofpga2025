@@ -1,0 +1,1 @@
+include Laboratories_intf.Laboratories (** @inline **)

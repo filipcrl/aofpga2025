@@ -11,12 +11,6 @@ module Dut1x5 = Laboratories.Make (struct
   let acc_w = 4
 end)
 
-(*let make_simulation ?config (module Dut) () =
-  let module Simulator = Cyclesim.With_interface (Dut.I) (Dut.O) in
-
-  let scope = Scope.create ~flatten_design:false () in
-  Simulator.create ?config (Dut.create scope)*)
-
 let aocexample = {|
 .......S.......
 ...............
@@ -115,6 +109,56 @@ let%expect_test "short input, no gaps" =
   let result = Bits.to_int !(outputs.out) in
   Format.printf "result=%u@." result;
   Out_channel.flush oc;
+  [%expect {|
+    ..S..
+    .|^|.
+    |^||.
+    |.||^
+    result=2
+    |}]
+  
+let capture_lines sim out beams_valid beams_next ~f =
+  let bits = ref Bits.empty in
+  let cycle () =
+    Cyclesim.cycle sim;
+    if Bits.is_vdd !beams_valid then
+      bits := Bits.concat_msb_e [!bits; !beams_next] in
+
+  f cycle;
+
+  let beams = Bits.split_msb ~exact:false ~part_width:5 !bits in
+  List.iter (List.zip_exn (strip_and_filter_lines twolines) beams) ~f:(fun (line, beams) ->
+    print_endline (line_of_bits ~line beams));
+
+  let result = Bits.to_int !out in
+  Format.printf "result=%u@." result
+
+let%expect_test "short input, no gaps" =
+  let scope = Scope.create ~flatten_design:false () in
+  let module Simulator = Cyclesim.With_interface (Dut1x5.I) (Dut1x5.O) in
+  let sim = Simulator.create ~config:Cyclesim.Config.trace_all (Dut1x5.create scope) in
+  let inputs = Cyclesim.inputs sim in
+  (* Need to sample before the clock edge since beams_valid is combinational *)
+  let outputs = Cyclesim.outputs ~clock_edge:Before sim in
+
+  capture_lines sim outputs.out outputs.beams_valid outputs.beams_next
+    ~f:(fun cycle ->
+      inputs.valid := Bits.gnd;
+      inputs.clear := Bits.vdd;
+      cycle ();
+      inputs.clear := Bits.gnd;
+      inputs.valid := Bits.vdd;
+
+      List.iter (strip_and_filter_lines twolines) ~f:(fun line ->
+        List.iter (words_of_line ~word_w:1 line) ~f:(fun word ->
+          (* Format.printf "%a @." Bits.pp word; *)
+          inputs.data := word;
+          cycle ()));
+
+      inputs.valid := Bits.gnd;
+
+      (* wait for flush *)
+      for _ = 1 to 3 do cycle () done);
   [%expect {|
     ..S..
     .|^|.

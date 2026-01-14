@@ -1,4 +1,0 @@
-(executable
- (public_name adventoffpga)
- (name generate)
- (libraries adventoffpga hardcaml))
