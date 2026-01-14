@@ -2,9 +2,20 @@ open Core
 open Hardcaml
 (* open Hardcaml_waveterm *)
 open Adventoffpga
-module Simulator = Cyclesim.With_interface (Laboratories.I) (Laboratories.O)
 
-let ceil_div = Laboratories.ceil_div
+let ceil_div a b = 1 + ((a - 1) / b) 
+
+module Dut1x5 = Laboratories.Make (struct
+  let word_w = 1
+  let line_w = 5
+  let acc_w = 4
+end)
+
+(*let make_simulation ?config (module Dut) () =
+  let module Simulator = Cyclesim.With_interface (Dut.I) (Dut.O) in
+
+  let scope = Scope.create ~flatten_design:false () in
+  Simulator.create ?config (Dut.create scope)*)
 
 let aocexample = {|
 .......S.......
@@ -51,14 +62,14 @@ let line_of_bits ~line bits =
 let words_of_line ~word_w line =
   let open Bits in
   let bits = bits_of_line line in
-  (*Format.printf "line=%a @." Bits.pp bits;*)
   let num_of_bits = ceil_div (width bits) word_w * word_w in
   let extra = num_of_bits - (width bits) in
   Bits.split_msb ~part_width:word_w (sll (uresize bits num_of_bits) extra)
 
-let%expect_test "Short input" =
+let%expect_test "short input, no gaps" =
   let scope = Scope.create ~flatten_design:false () in
-  let sim = Simulator.create ~config:Cyclesim.Config.trace_all (Laboratories.create scope) in
+  let module Simulator = Cyclesim.With_interface (Dut1x5.I) (Dut1x5.O) in
+  let sim = Simulator.create ~config:Cyclesim.Config.trace_all (Dut1x5.create scope) in
   let filename = "/tmp/short_input.vcd" in
   let oc = Out_channel.create filename in
   let sim = Vcd.wrap oc sim in
