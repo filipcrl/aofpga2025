@@ -1,5 +1,3 @@
-open Hardcaml
-
 module type Config = sig
   val word_w : int
   val line_w : int
@@ -26,7 +24,7 @@ module type S = sig
     [@@deriving hardcaml]
   end
 
-  val create : Scope.t -> Signal.t I.t -> Signal.t O.t
+  val create : Hardcaml.Scope.t -> Hardcaml.Signal.t I.t -> Hardcaml.Signal.t O.t
 end
 
 module type Laboratories = sig

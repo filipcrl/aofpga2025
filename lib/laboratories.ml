@@ -6,6 +6,26 @@ include Laboratories_intf
 
 let ceil_div a b = 1 + ((a - 1) / b) 
 
+module Shift_register = struct
+  type t = Always.Variable.t array
+
+  let create ?name ~width ~n spec : t =
+    Array.init n ~f:(fun i ->
+      let reg = Always.Variable.reg ~width spec in
+      (match name with
+      | Some name -> reg.value -- (Printf.sprintf "%s-%d" name i) |> ignore;
+      | None -> ());
+      reg)
+
+  let shift (t : t) data =
+    let open Always in
+    Array.mapi t ~f:(fun i reg ->
+      match i with
+      | 0 -> reg <-- data
+      | i -> reg <-- t.(i-1).value)
+    |> Array.to_list |> proc
+end
+
 module Make (Config : Config) = struct
   module Config = Config
   open Config 
@@ -63,26 +83,6 @@ module Make (Config : Config) = struct
       ()
     |> fun a -> a.(0)
 
-  module Shift_register = struct
-    type t = Always.Variable.t array
-
-    let create ?name ~width ~n spec : t =
-      Array.init n ~f:(fun i ->
-        let reg = Always.Variable.reg ~width spec in
-        (match name with
-        | Some name -> reg.value -- (Printf.sprintf "%s-%d" name i) |> ignore;
-        | None -> ());
-        reg)
-
-    let shift (t : t) data =
-      let open Always in
-      Array.mapi t ~f:(fun i reg ->
-        match i with
-        | 0 -> reg <-- data
-        | i -> reg <-- t.(i-1).value)
-      |> Array.to_list |> proc
-  end
-
   let create scope ({ clock; clear; valid; data } : _ I.t) =
     let open Always in
     let spec = Reg_spec.create ~clock ~clear () in
@@ -95,7 +95,7 @@ module Make (Config : Config) = struct
     let splitters = Shift_register.create ~name:"splitters" ~width:word_w ~n:2 spec in
     let%hw_var beams1 = Variable.reg ~width:word_w spec in
 
-    let write_address_sr = Shift_register.create ~width:(counter_w+1) ~n:2 spec in
+    let write_address_sr = Shift_register.create ~name:"write_addr_sr" ~width:(counter_w+1) ~n:2 spec in
 
     let prev_bit = Variable.reg ~width:1 spec in
     let buf_sel = Variable.reg ~width:1 spec in 
@@ -174,17 +174,20 @@ module Make (Config : Config) = struct
         ])
       ; (Flush,
         [ flush_cnt <-- flush_cnt.value -:. 1
-        ; advance ()
         ; acc <-- acc.value +: uresize count acc_w
-        ; shift_write_address ()
+        (* ; when_ ((~:valid) &&: (flush_cnt.value <>:. 0)) [shift_write_address ()] *)
         ; prev_bit <-- prev_bit_next
+        ; when_ ((flush_cnt.value <>:. 0) ||: valid)
+          [ advance ()
+          ; shift_write_address ()
+          ]
         ; when_ valid
           [ counter <-- counter.value +:. 1
           ; read_addr_delayed <-- beams_read_addr
           ]
         ; when_ (flush_cnt.value ==:. 0)
           [ if_ (valid &&: counter.value ==:. 1)
-            [if_ (last) [flush ()] [sm.set_next Run] ]
+            [if_ (last) [flush ()] [sm.set_next Run]]
             [sm.set_next Wait]
           ]])]
     ] |> compile;
