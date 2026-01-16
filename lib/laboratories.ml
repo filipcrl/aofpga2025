@@ -33,6 +33,9 @@ module Make (Config : Config) = struct
   let counter_max = ceil_div line_w word_w
   let counter_w = Int.ceil_log2 counter_max
 
+  (* Do not allow 1 word long inputs *)
+  let () = assert (counter_max > 1)
+
   module I = struct
     type 'a t =
       { clock : 'a
@@ -175,7 +178,6 @@ module Make (Config : Config) = struct
       ; (Flush,
         [ flush_cnt <-- flush_cnt.value -:. 1
         ; acc <-- acc.value +: uresize count acc_w
-        (* ; when_ ((~:valid) &&: (flush_cnt.value <>:. 0)) [shift_write_address ()] *)
         ; prev_bit <-- prev_bit_next
         ; when_ ((flush_cnt.value <>:. 0) ||: valid)
           [ advance ()

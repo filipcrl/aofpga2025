@@ -1,5 +1,5 @@
 (library
  (name test_adventoffpga)
- (libraries core stdio adventoffpga hardcaml hardcaml_waveterm)
+ (libraries core stdio adventoffpga hardcaml)
  (preprocess (pps ppx_hardcaml ppx_jane))
  (inline_tests))
